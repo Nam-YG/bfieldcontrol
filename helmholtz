@@ -1,0 +1,51 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import pyvista as pv
+from bfieldtools.utils import cylinder_points
+from bfieldtools.line_magnetics import magnetic_field
+
+# Create helmholtz coil with radius R
+R = 5
+
+c_points = cylinder_points(
+    radius=R, length=0, nlength=1, nalpha=100, orientation=np.array([0, 1, 0])
+)
+c_points[:, 1] = 0
+c_points = np.vstack((c_points, c_points[0, :]))
+
+c1_points = c_points - np.array([0, R / 2, 0])
+c2_points = c_points + np.array([0, R / 2, 0])
+
+# PyVista plot setup
+plotter = pv.Plotter(window_size=(1200, 800))
+plotter.background_color = "white"
+
+# Add coil paths
+line1 = pv.lines_from_points(c1_points)
+line2 = pv.lines_from_points(c2_points)
+plotter.add_mesh(line1, color="blue", line_width=2, label="Coil 1")
+plotter.add_mesh(line2, color="red", line_width=2, label="Coil 2")
+
+# Create a grid for the field
+box = 3 * R
+n = 50
+xx = np.linspace(-box, box, n)
+yy = np.linspace(-box, box, n)
+zz = np.linspace(-box, box, n)
+X, Y, Z = np.meshgrid(xx, yy, zz, indexing="ij")
+
+x = X.ravel()
+y = Y.ravel()
+z = Z.ravel()
+b_points = np.array([x, y, z]).T
+
+# Calculate the magnetic field
+B = np.zeros(b_points.shape)
+B += magnetic_field(c1_points, b_points)
+B += magnetic_field(c2_points, b_points)
+
+B_matrix = B.reshape((n, n, n, 3))
+B_matrix_norm = np.linalg.norm(B_matrix, axis=-1)
+
+plotter.show()
+
