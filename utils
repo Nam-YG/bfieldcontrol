@@ -1,0 +1,380 @@
+"""
+This module contains miscellaneous utility functions used across bfieldtools.
+"""
+
+__all__ = [
+    "MeshProjection",
+    "combine_meshes",
+    "cylinder_points",
+    "dual_areas",
+    "find_mesh_boundaries",
+    "fix_normals",
+    "inner2vert",
+    "load_example_mesh",
+    "tri_normals_and_areas",
+    "vert2inner",
+] #공개함수, 클래스 목록 명시
+
+
+import os
+import numpy as np
+import pkg_resources
+import trimesh
+
+from .quadratures import get_quad_points
+
+
+def combine_meshes(meshes): ##여러개의 trimesh 객체를 하나로 합친다. ## Mesh들이 겹치지 않는 가정하에 동작, 복잡한 연산 x
+    """
+    Combine two or more non-overlapping Trimesh meshes without any dependency
+    requirements. For more demanding applications, use Trimesh boolean operations
+
+    Parameters
+    ----------
+    meshes: list or tuple 
+        Each element should be a Trimesh mesh
+## meshes는 trimesh의 요소여야함(튜플 or 리스트)
+    Returns
+    -------
+    combined_mesh: Trimesh mesh ## 결합된 단일 trimesh 반환
+    """
+
+    N_meshes = len(meshes) #mesh의 개수를 저장
+
+    vertices = np.zeros((0, 3)) ## 모든 mesh의 정점을 저장. 초기값은 (0,3) 크기의 빈 배열, x,y,z를 나타낸다
+    faces = np.zeros((0, 3)) ## mesh의 면 정보를 저장
+
+    for idx in range(N_meshes): ##idk는 메시를 순서대로 처리하기 위함
+
+        faces = np.vstack((faces, meshes[idx].faces + len(vertices))) ##meshes[idx]의 faces를 기존의 faces 배열과 수직으로 쌓는다
+        ##meshes[idx].faces + len(vertices)는 기존 vertices의 개수를 더해서 인덱스를 재조정한다. vertex 번호가 충돌하지 않게끔 하기 위함
+				vertices = np.vstack((vertices, meshes[idx].vertices)) ##vertices를 기존의 vertices 배열과 수직으로 쌓는다다
+
+    combined_mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+##vertices: 모든 vertex를 포함, faces: 모든 삼각현 면 정보를 포함, process=False: 자동으로 메시를 처리하지 않도록 해서 성능을 최적화한다
+    return combined_mesh
+##결론: combined_mesh 함수는 결합된 trimesh를 반환
+
+
+def tri_normals_and_areas(r, tri):
+    """Get triangle normals and areas from vertices (r) and
+    triangle indices (tri)
+    """
+##이 함수는 주어진 정점 배열 'r'과 삼각형 면의 정점 인덱스 'tri'를 사용하여 각 삼각형의 법선벡터와 면적을 계산한다.
+    n = np.cross(
+        r[tri[:, 1], :] - r[tri[:, 0], :], r[tri[:, 2], :] - r[tri[:, 0], :], axis=1
+    ) ## n함수: 삼각형 면의 법선벡터를 계산한다. r[삼각형의 두번째 정점과 첫번째 정점간의 벡터 계산, ''], np.cross()는 두 벡터의 외적계산 --> normal vector를 계산한다.
+## axis=1: 행 별로 외적을 계산한다 (배열의 각 삼각형에 대해 계산한다)
+    a = np.linalg.norm(n, axis=1) ##법선 벡터의 크기 계산
+    n = n / a[:, None] #단위 법선 벡터
+    a /= 2 ##삼각형 면적 계산
+    return n, a ##각 삼각형의 단위 법선벡터와 면적을 반환한다.
+
+
+def dual_areas(tris, ta): ##각 노드에 대해 이우한 삼각형들의 면적 합을 계산한 후, 이를 3으로 나눈 값
+    """Calculate (dual) areas for each node in inds
+
+    Dual area == area summed over the neighbouring triangles divided by 3
+    """
+    areas = np.zeros(np.max(tris) + 1) ##면적 합을 저장하는 배열
+    for i in range(tris.shape[0]):
+        for j in range(tris.shape[1]):
+            areas[tris[i, j]] += ta[i]
+
+    return areas / 3
+
+
+def find_mesh_boundaries(mesh): ## mesh의 열린 경계를 찾음
+    """
+    Finds the open boundaries of a mesh by finding the edges that only
+    belong to a single triangle. Returns an index array of inner vertices
+    and triangles that do not touch the outer boundary.
+    Takes edge parameter for convenience.
+
+    Parameters
+    ----------
+    mesh: trimesh mesh object
+
+    Returns
+    -------
+    boundaries: list of array-like
+
+    """
+    inner_vertices = np.arange(0, len(mesh.vertices))
+
+    outline = mesh.outline(process=False) ##mesh의 경계를 찾는다
+
+    boundaries = [] ##경계의 정점들을 저장
+    for i in outline.entities: ##경계를 구성하는 선분데이터를 가져온다
+        boundaries.append(np.unique(i.points)) ##np.unique는 중복된 정점 제거, append를 통해 경계의 정점을 리스트에 추가한다
+
+        inner_vertices = np.setdiff1d(inner_vertices, i.points) ## inner_vertices에서 i.point를 제이해 경계에 속하지 않는 정점만 남긴다
+
+    return boundaries, inner_vertices
+## mesh의 경계 정점 리스트 (한개의 삼각형에만 포함되는 꼭지점)과 경계에 속하지 않는 내부 정점 배열을 반	
+
+def inner2vert(mesh, inner_vertices, holes):
+    """Linear mapping of the inner (free) weights in the stream function
+    discretization to weights in all vertices
+
+    Parameters:
+        mesh: Trimesh object
+        inner_vertices: list of indices of the inner vertices of the mesh
+        holes: list of indices for holes in the mesh
+
+    Returns:
+        NxM sparse array, where N==mesh.vertices.shape[0]
+        and M == len(inner_vertices) + len(holes)
+    """
+    from scipy.sparse import csr_matrix
+
+    N = mesh.vertices.shape[0] ##메시 정점의 총 개수
+    M = len(inner_vertices) + len(holes) ## 내부 정점과 구멍의 개수 
+    ii = list(inner_vertices)  # indices of inner vertices
+    jj = list(np.arange(len(inner_vertices)))  # indices of inner vertices in dof (내부 정점의 자유도 인덱스 리스트)
+    # Hole values maps to value for each hole vertex
+    for n, h in enumerate(holes):
+        ii.extend(list(h))  # indices of hole indices, 각 구멍의 정점을 ii에 추가
+        jj.extend(
+            [len(inner_vertices) + n] * len(h)
+        )  # len(h) times index of hole in dof, 자유도 인덱스에 구멍번호 추가
+    d2v = csr_matrix((np.ones(len(jj)), (ii, jj)), shape=(N, M), dtype=float)
+## ii: 정점인덱스, jj:자유도 인덱스
+    return d2v
+
+
+def vert2inner(mesh, inner_vertices, holes):
+    """Linear mapping of the all weights in the stream function
+    discretization to inner (free) weights
+
+    Parameters:
+        mesh: Trimesh object
+        inner_vertices: list of indices of the inner vertices of the mesh
+        holes: list of indices for holes in the mesh
+
+    Returns:
+        MxN sparse array, where N==mesh.vertices.shape[0]
+        and M == len(inner_vertices) + len(holes)
+    """
+    from scipy.sparse import csr_matrix
+
+    N = mesh.vertices.shape[0]
+    M = len(inner_vertices) + len(holes)
+    ii = list(inner_vertices)  # indices of inner vertices
+    jj = list(np.arange(len(inner_vertices)))  # indices of inner vertices in dof
+    vals = list(np.ones(len(inner_vertices)))
+    for n, h in enumerate(holes):
+        ii.extend(list(h))  # indices of hole indices
+        jj.extend(
+            [len(inner_vertices) + n] * len(h)
+        )  # len(h) times index of hole in free values
+        # Values at holes map to their average (ok, when constant boundary condition satisfied)
+        vals.extend(list(np.ones(len(h)) / len(h))) ##각 구멍의 정점 가중치는 1/hole의 정점 개수로 설
+    v2d = csr_matrix((vals, (jj, ii)), shape=(M, N), dtype=float)
+
+    return v2d
+
+
+def cylinder_points(
+    radius=1,
+    length=1,
+    nlength=10,
+    alpha=360,
+    nalpha=10,
+    center=np.array([0, 0, 0]),
+    orientation=np.array([1, 0, 0]),
+): ## nlength: 길이 방향으로의 점의 개수, nalpha: 각도 방향으로 점의 개수 center: 원기둥 중심, orientation: 원기둥 축방향
+    """
+    Generate and return a set of points on a cylindrical surface.
+    """
+    # Create the length array(길이배열 생성)
+    I = np.linspace(0, length, nlength)
+
+    # Create alpha array avoid duplication of endpoints
+    # Conditional should be changed to meet your requirements
+    if int(alpha) == 360:
+        A = np.linspace(0, alpha, num=nalpha, endpoint=False) / 180 * np.pi
+    else:
+        A = np.linspace(0, alpha, num=nalpha) / 180 * np.pi
+
+    # Calculate X and Y, 원기둥 좌표계로 변환
+    X = radius * np.cos(A)
+    Y = radius * np.sin(A)
+
+    # Tile/repeat indices so all unique pairs are present
+    pz = np.tile(I, nalpha)
+    px = np.repeat(X, nlength)
+    py = np.repeat(Y, nlength)
+
+    points = np.vstack((pz, px, py)).T
+
+    # Shift to center
+    shift = np.array(center) - np.mean(points, axis=0)
+    points += shift
+
+    # Orient tube to new vector
+
+    def rotation_matrix(axis, theta):
+        a = np.cos(theta / 2) #회전 각도의 절반에 대한 코사인을 계싼해서 회전행렬 요소로 사용
+        b, c, d = -axis * np.sin(theta / 2) 
+        return np.array(
+            [
+                [
+                    a * a + b * b - c * c - d * d,
+                    2 * (b * c - a * d),
+                    2 * (b * d + a * c),
+                ],
+                [
+                    2 * (b * c + a * d),
+                    a * a + c * c - b * b - d * d,
+                    2 * (c * d - a * b),
+                ],
+                [
+                    2 * (b * d - a * c),
+                    2 * (c * d + a * b),
+                    a * a + d * d - b * b - c * c,
+                ],
+            ]
+        )##주어진 축과 각도에 따라 3x3 회전 행렬의 생성하여 반환
+
+    ovec = orientation / np.linalg.norm(orientation) ##방향벡터 생성
+    cylvec = np.array([1, 0, 0]) ##기본적인 원통축을 정의하는 벡터(단위벡터)
+
+    if np.allclose(cylvec, ovec): (cylvec:기본축 과 ovec:정규화된 방향벡터가 같은 방향인지 비교)
+        return points
+
+    # Get orthogonal axis and rotation
+    oaxis = np.cross(ovec, cylvec) ##ovec과 cylvec간의 외적을 계산해서 회전축을 결정한다
+    rot = np.arccos(np.dot(ovec, cylvec)) ##두 벡터간의 내적을 계산하고 아크코사인을 취해 회전 각도를 계산
+
+    R = rotation_matrix(oaxis, rot) ##앞서 계산한 회전축과 각도를 이용해서 회전행렬을 생성한다
+    return points.dot(R)
+
+
+def fix_normals(mesh, origin=np.array([0, 0, 0])):
+    """
+    Attempts to fix face windings and normals such that normals are always "pointing out"
+    from the origin.
+
+    Parameters
+    ----------
+    mesh: Trimesh mesh object
+    origin: array-like (3, )
+        Specified from where the normals should "point out"
+
+    Returns
+    -------
+    mesh: modified Trimesh object
+
+
+    """
+
+    # Dot product of all face normals and the corresponding triangle centers
+##(번역) 모든 면의 법선벡터와 대응하는 삼각형 중심좌표를 내적한다
+## mesh의 삼각형 중심 좌표와 origin간 벡터를 이용해 각 면의 노멀과의 내적을 계산한다
+    dotprods = np.sum(mesh.face_normals * (mesh.triangles_center - origin), axis=-1)
+    # Flip windings for normals pointing inwards
+##내적 값이 음수인 경우(법선 벡터가 안쪽을 향하는 경우) 해당 삼각형의 면 순서를 반대로 바꿔 법선벡터의 방향을 수정한다.
+    mesh.faces[dotprods < 0] = mesh.faces[dotprods < 0, ::-1]
+    # old_cache = {'key': mesh.cache.value, ...} # Could save some old values...
+    # Clear cached values, 메쉬의 캐시 데이터를 초기화해서 변경사항을 반영한다
+    mesh._cache.clear()
+    # Could update the cache with values that don't change when flipping triangles
+    # self._cache.update(old_cache)
+    return mesh
+
+
+def load_example_mesh(mesh_name, process=True, **kwargs): ##얘는 뭔지 잘 모르겠음
+    """
+    Convenience function used load example meshes included with the package
+
+    Parameters
+    ----------
+    mesh_name: string
+        name of mesh, i.e. filename without extension
+    process: Boolean
+        Whether trimesh should process the mesh on loading
+    kwargs
+        Passed to trimesh object creation
+
+    Returns
+    -------
+    Trimesh object
+    """
+    existing_files = pkg_resources.resource_listdir("bfieldtools", "example_meshes")
+
+    # Filter according to file extension
+    existing_files = [
+        file
+        for file in existing_files
+        if file.lower().endswith(tuple(trimesh.exchange.load.mesh_formats()))
+    ]
+
+    # Remove file extension to get name
+    existing_names = [os.path.splitext(file)[0] for file in existing_files]
+
+    # Check if name exists
+    if mesh_name not in existing_names:
+        raise ValueError(
+            "Mesh with name %s not found in example_meshes folder" % mesh_name
+        )
+
+    filename = existing_files[existing_names.index(mesh_name)]
+
+    return trimesh.load(
+        pkg_resources.resource_filename("bfieldtools", "example_meshes/" + filename),
+        process=process,
+        **kwargs
+    )
+
+
+class MeshProjection: ##주어진 mesh에서 삼각형 요소의 기저함수로 특정하무의 사영을 계산하는 클래스.
+##클래서의 생성자에서는 mesh와 관련된 사전계산을 수행하고, hatfunc_innerproduct에서는 특정함수와 hatfuction의 내적을 계산한다
+    """Class for constructing projection of an arbitrary function
+    to the hat functions of the given mesh
+
+    The constructor initializes quadrature points, point weights
+    and vertex mappings
+
+    After the construction the method "hatfunc_innerproducts" can
+    be called to obtain inner products of the hat functions and
+    a given function (func)
+    """
+
+    def __init__(self, mesh, quad_degree):
+        self.mesh = mesh ##클래스에 전달된 메쉬 데이터를 self.mesh에 저장
+
+        weights, self.quadpoints, ref_coords = get_quad_points(
+            mesh.vertices, mesh.faces, ("dunavant", quad_degree), return_ref_coords=True
+        )
+        # Mapping from coordinates of a reference triangle to barycentric coordinates
+        self.M = np.array([[-1.0, -1.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+        # Solve barycentric coordinates for the quad points
+        # These are the shape function values for the quad points
+				## 참조 삼각형에서 꼭짓점 좌표(정점)를 사용해 삼각형의 좌표를
+        ## 베리센트릭 좌표(barycentric coordinates)로 변환하기 위한 행렬을 정의.
+        self.bary_coords = (
+            np.hstack((ref_coords, np.ones((ref_coords.shape[0], 1)))) @ self.M.T
+        )
+        # Weight the shape function values by quadrature weights
+	## ref_coords에 추가된 열벡터 [1]을 self.M.T과 곱하여 계산
+	## 결과는 사중적분점의 berycentric coordinate(=hat function)
+        self.weights = self.bary_coords * weights[:, None] ##가중치 계산
+        from scipy.sparse import csc_matrix ##csc_matrix를 사용하기 위해 scipy import
+
+        Nf = len(mesh.faces) ##faces 수
+        Nv = len(mesh.vertices) ##vertices 
+        self.M0 = csc_matrix((np.ones(Nf), (np.arange(Nf), mesh.faces[:, 0])), (Nf, Nv))
+        self.M1 = csc_matrix((np.ones(Nf), (np.arange(Nf), mesh.faces[:, 1])), (Nf, Nv))
+        self.M2 = csc_matrix((np.ones(Nf), (np.arange(Nf), mesh.faces[:, 2])), (Nf, Nv))
+
+    def hatfunc_innerproducts(self, func):
+        ff = np.zeros((self.quadpoints.shape[0], 3)) ## 결과 내적값을 저장할 배열 생성
+        for i in range(self.quadpoints.shape[1]): ## 각 삼각형에 대해 사중적분을 반복
+            f = func(self.quadpoints[:, i, :]) ## func를 사중적분점에 대해 평가
+            ff += self.weights[i] * f[:, None] #func의 평가값 f에 가중치를 곱하고 결과를 누적
+
+        ff *= self.mesh.area_faces[:, None] ##삼각형의 면적을 곱해 각 삼각형에서의 값을 보정
+        fv = ff[:, 0] @ self.M0 + ff[:, 1] @ self.M1 + ff[:, 2] @ self.M2 ##희소 행렬을 사용해 최종적으로 hatunction에 대한 내적 계
+
+        return fv
