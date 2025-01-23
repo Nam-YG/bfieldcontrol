@@ -1,0 +1,273 @@
+"""
+Functions for working with current polylines, e.g. for calculating the magnetic field and potentials as well as the inductance
+
+"""
+
+__all__ = [
+    "magnetic_field",
+    "mutual_inductance",
+    "scalar_potential",
+    "self_inductance",
+    "vector_potential",
+]
+
+import numpy as np
+from .integrals import omega
+import trimesh
+
+
+def cross(r1, r2): ##외적할때 사용함 함수의 오버헤드를 줄인다고 함
+    """Cross product without overhead"""
+    result = np.zeros(r1.shape)
+    result[0] = r1[1] * r2[2] - r1[2] * r2[1]
+    result[1] = r1[2] * r2[0] - r1[0] * r2[2]
+    result[2] = r1[0] * r2[1] - r1[1] * r2[0]
+    return result
+
+
+def magnetic_field(vertices, points): ## 선 전류로부터의 자기장 계산
+    """Compute B-field of a segmented line current.
+    See: Compact expressions for the Biot–Savart fields of a filamentary segments
+    by Hanson & Hirshman: https://doi.org/10.1063/1.1507589
+
+
+    Parameters
+    ----------
+
+    vertices: (N_line, 3) array
+        Vertices of the line with N_line-1 segments
+        The first and last vertices should be the same to close the loop.
+    points:   (N_points, 3) array
+        Magnetic field evaluation points
+
+    Returns
+    -------
+    bfield: (N_points, 3) array
+        Magnetic field at evaluation points
+
+    """
+    field = np.zeros(points.T.shape) ##(x,y,z)를 나타냄
+    for i in range(len(vertices) - 1):
+        r1 = vertices[i]
+        r2 = vertices[i + 1]
+
+        # Vectors between vertices and field points
+        a1 = points.T - r1.reshape(3, 1) ##자기장을 측정하고자 하는 지점과 정점 사이의 벡터터
+        a2 = points.T - r2.reshape(3, 1)
+
+        # Direction of the field
+        f = cross(a1, a2) ##cross 함수를 이용해 a1과 a2의 외적을 계산하고 이는 자기장의 방향을 나타낸다
+
+        # Vector lengths
+        d1 = np.sqrt(np.sum(a1**2, axis=0)) ##a1,a2(벡터)들의 크기
+        d2 = np.sqrt(np.sum(a2**2, axis=0))
+
+        # Normalize direction field and divide by cylindrical distance ## 자기장의 세기 및 방향을 보정한다
+        f *= (d1 + d2) / (d1 * d2 * (d1 * d2 + np.sum(a1 * a2, axis=0)))
+
+        field = field + f
+
+    return field.T * 1e-7
+
+
+def vector_potential(vertices, points, reg=1e-12, symmetrize=True):
+    """Compute vector potential of a segmented line currents. ##벡터 포텐셜을 계산한다, point가 자기장을 구하고자 하는 지점
+    Based on straightforward integration of 1/r potential over a line
+    i.e. the gamma0 integral
+
+    See: Compact expressions for the Biot–Savart fields of a filamentary segments
+    by Hanson & Hirshman: https://doi.org/10.1063/1.1507589
+
+
+    Parameters
+    ----------
+    vertices: (N_line, 3) array
+        Vertices of the line with N_line-1 segments
+        The first and last vertices should be the same to close the loop.
+    points: (N_points, 3) array
+        Evaluation points
+
+    Returns
+    -------
+    A: array (Npoints, 3)
+        Vector potential
+
+    """
+
+    segments = vertices[1:] - vertices[:-1] ##선 전류를 구성하는 벡터, 각 선분의 벡터를 계산한다
+    RR = vertices[:, None, :] - points[None, :, :] ##각 vertex와 point(자기장을 구하고자 하는 지점) 사이의 벡터차
+    dotprods2 = np.sum(RR[1:] * segments[..., None, :], axis=-1) ##벡터 내적, axis=-1은 마지막 차원을 따라 내적 계산
+    dotprods1 = np.sum(RR[:-1] * segments[..., None, :], axis=-1)
+    ss = np.linalg.norm(segments, axis=-1) ##각 선분의 길이 np.linalg.norm은 벡터의 크기ㅡㄹ 계산하고, axis=-1은 선분 벡터의 x,y,z를 기준으로 크기를 계산
+    segments /= ss[..., None] ## 선분벡터를 단위벡터로 변환한다
+    rr = np.linalg.norm(RR, axis=-1) ##vertex와 point 사이의 거리
+
+    # Regularize s.t. neither the denominator or the numerator can be zero
+    # Avoid numerical issues directly at the edge
+    res = np.log(
+        (rr[1:] * ss[..., None] + dotprods2 + reg)
+        / (rr[:-1] * ss[..., None] + dotprods1 + reg)
+    )
+
+    # Symmetrize the result since on the negative extension of the edge
+    # there's division of two small values resulting numerical instabilities
+    # (also incompatible with adding the reg value)
+    if symmetrize:
+        res2 = -np.log(
+            (rr[1:] * ss[..., None] - dotprods2 + reg)
+            / (rr[:-1] * ss[..., None] - dotprods1 + reg)
+        )
+        res = np.where(dotprods1 + dotprods2 > 0, res, res2)
+
+    return 1e-7 * np.sum(res[..., None] * segments[..., None, :], axis=0) ##axis=0은 선분을 따라 결과를 합산
+
+
+def scalar_potential(vertices, points):
+    """Computes the scalar magnetic potential of a segmented current loop at given points.
+    This is equal to the solid angle spanned by the loop (polygon), times a constant.
+    The first and last vertices should be the same to close the loop.
+## segmented된 전류 루프에서의 스칼라 포텐셜 계산을 함함
+
+    Parameters
+    ----------
+    vertices: (N_line, 3) array
+        Vertices of the line with N_line-1 segments
+        The first and last vertices should be the same to close the loop.
+    points: (N_points, 3) array
+        Evaluation points
+
+    Returns
+    -------
+    U: array (Npoints, )
+        Scalar magnetic potential
+
+    """
+
+    N_verts = len(vertices) ##전류 루프의 vertex 개수를 저장
+
+    # VERTEX MASS CENTRE
+    mass_center = np.mean(vertices, axis=0)
+
+    vertices = np.vstack((vertices, mass_center)) ##vertex들의 배열에 질량중심을 추가
+
+    # CREATE TRIANGLE FAN
+    faces = np.full(shape=(N_verts - 1, 3), fill_value=np.nan, dtype=int)
+
+    for i in range(N_verts - 1):
+        faces[i] = np.array([i, i + 1, N_verts])
+
+    R1 = vertices[faces]
+    R2 = points
+## 삼각형 vertex 좌표와 자기장을 구하려는 지점 좌표를 저장한다
+    RR = R2[:, None, None, :] - R1[None, :, :, :]
+## point와 vertex사이의 벡터를 계산한다다
+    # COMPUTE SOLID ANGLE
+    return -1 * np.sum(omega(RR), axis=1) / (4 * np.pi) 
+##스칼라 포텐셜을 반환
+
+
+def mutual_inductance(path1, path2, Nquad=2, radius=1e-3):
+    """Compute magnetic flux created by a segmented line current loops
+    (path1) on a another closed loop of segmented current
+    (path2). The other loop(s) is numerically integrated.
+
+    In other words, calculate mutual inductance of the current loops.
+
+    **SELF INDUCTANCE OF A LOOP IS BASED ON ROUND-WIRE APPROXIMATION**
+
+    Parameters
+    ----------
+    path1: trimesh.Path3D-object
+
+    path2: trimesh.Path3D-object
+
+    Nquad: int, the number of quadrature points on line segments
+
+    radius: float
+        radius of the wire, only used for self-inductance calcultion
+        self-inductance is dependent on the wire cross section
+    Returns
+    -------
+     flux in the other loop generated by loops (Nloops,)
+
+
+    """
+    # Calculate quadrature points linearly spaced on the line segments
+    # of the other loop
+    t = np.linspace(0, 1, Nquad + 1) ##Nquad의 등간격 분할점을 생성한다
+
+    fluxes = np.zeros((len(path1.entities), len(path2.entities))) ##루프에서 자기선속을 저장할 배열 초기
+    ##path2의 vertices를 추출하고 각 선분의 벡터(sides)를 계산한다
+    for j, loop2 in enumerate(path2.entities):
+        vertices_other = path2.vertices[loop2.nodes, :]
+        # sides = vertices_other[1:] - vertices_other[:-1]
+        sides = vertices_other[:, 1] - vertices_other[:, 0]
+        segments = (t[1:, None, None] - t[:-1, None, None]) * sides ## 분할된 구간에서 각 선분의 작은 부분을 계산
+
+        tq = 0.5 * (t[1:] + t[:-1])  # Nquad points on the segments
+
+        # Nquad, Nsegments, 3
+        points = vertices_other[:, 0] + tq[:, None, None] * sides ##분활된 구간에서 points 좌표를 계산
+        shape = points.shape
+
+##자기 선속을 계산하고, 같은 루프에 대해서는 self-inductance를 사용용
+        for i, loop1 in enumerate(path1.entities):
+            if (path1 is path2) and i == j:
+                fluxes[i, j] = self_inductance(path1, loop1, radius)
+            else:
+                vertices = path1.vertices[loop1.points]
+                a = vector_potential(vertices, points.reshape(-1, 3)) ## 첫번째 루프에서 point에서의 vector potential을 계산
+
+                # Nquad, Nsegments, 3
+                a = a.reshape(shape)
+
+                # Take dot product between vector potential and the line segments
+                # corresponding to each quadrature points (axis=0) and sum over the
+                # segments (axis=1) and quadrature points on each segment (axis=2)
+
+                fluxes[i, j] = np.sum(a * segments, axis=(0, 1, 2)) ###자기 벡터 포텐셜과 각 선분의 내적을 통해 flux를 계산
+
+    return fluxes
+
+
+def self_inductance(path, loop, radius=1e-3):
+    """
+    Calculate self inductance based on round-wire approximation
+    http://www.thompsonrd.com/induct2.pdf
+    section 5.
+
+
+    Parameters
+    ----------
+    path : path3D object
+    loop : entity of the path3D object
+        entity describing the single loop
+    radius : the radius of the wire
+        DESCRIPTION. The default is 1e-3.
+
+    Returns
+    -------
+    self_ind : float
+
+    """
+    mu0_over2pi = (1e-7) * 2 ###자기장 상수 뮤_0/2pi 정의
+    # Perimeter
+    p = loop.length(path.vertices) ##loop의 둘레길이 계산
+
+    # CREATE TRIANGLE FAN for area calculation
+##루프의 vertex와 질량중심 계산
+    vertices = path.vertices[loop.points] 
+    N_verts = len(vertices)
+    mass_center = np.mean(vertices, axis=0)
+    vertices = np.vstack((vertices, mass_center))
+    faces = np.full(shape=(N_verts - 1, 3), fill_value=np.nan, dtype=int)
+    for i in range(N_verts - 1):
+        faces[i] = np.array([i, i + 1, N_verts]) ##루프를 triangle fan으로 표현
+    mesh = trimesh.Trimesh(vertices, faces)
+    # Area
+    A = mesh.area ##면적 계산
+
+    # This is an approximation for round wire 공식에 따라 결과 계산
+    self_ind = mu0_over2pi * p * (np.log(2 * A / (p * radius)) + 0.25) 
+
+    return self_ind
